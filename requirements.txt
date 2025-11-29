@@ -4,3 +4,4 @@ numpy
 openpyxl
 xlrd
 google-genai
+tabulate
