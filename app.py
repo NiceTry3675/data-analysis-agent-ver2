@@ -1,9 +1,11 @@
 import io
 import json
 import os
+import re
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from google import genai
@@ -98,12 +100,13 @@ def safe_dataframe_display(df: pd.DataFrame, height: int = None):
 # 2. LLM 로직 (Schema 설계 + Code Gen)
 # ==============================================================================
 
-def generate_target_schema(api_key: str, all_previews: List[str]) -> Dict[str, Any]:
+def generate_target_schema(api_key: str, all_previews: List[str]) -> Tuple[Dict[str, Any], str, Optional[str]]:
     """
-    여러 파일의 프리뷰를 보고 공통 목표 스키마(Target Schema)를 제안
+    여러 파일의 프리뷰를 보고 공통 목표 스키마(Target Schema)를 제안.
+    반환: (schema_dict, raw_response_text, error_message)
     """
     client = genai.Client(api_key=api_key)
-    
+
     previews_text = "\n\n".join([f"--- File Sample {i+1} ---\n{p}" for i, p in enumerate(all_previews[:3])])
 
     prompt = f"""
@@ -130,35 +133,36 @@ def generate_target_schema(api_key: str, all_previews: List[str]) -> Dict[str, A
 ```
 반드시 위 JSON 형식만 출력하세요.
 """
-    resp = client.models.generate_content(
-        model="gemini-3-pro-preview",
-        contents=prompt,
-    )
-    
-    text = resp.text
+    raw_text = ""
     try:
-        return json.loads(extract_json_block(text))
-    except json.JSONDecodeError as e:
-        # 파싱 실패 시 에러 정보를 담아 리턴 (UI에서 처리)
-        return {"columns": [], "_error": f"JSON 파싱 실패: {e}", "_raw_response": text}
+        resp = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=prompt,
+        )
+        raw_text = resp.text
+        schema = json.loads(extract_json_block(raw_text))
+        if not isinstance(schema, dict):
+            raise ValueError("LLM 응답이 dict 형식이 아닙니다.")
+        return schema, raw_text, None
     except Exception as e:
-        return {"columns": [], "_error": f"알 수 없는 오류: {e}", "_raw_response": text}
+        return {"columns": []}, raw_text, str(e)
 
 
 def generate_transform_code(
-    api_key: str, 
-    file_name: str, 
-    sheet_name: str, 
+    api_key: str,
+    file_name: str,
+    sheet_name: str,
     df_preview: str,
     target_columns: List[str]
-) -> str:
+) -> Tuple[str, str, Optional[str]]:
     """
-    Raw Data -> Target Schema로 변환하는 파이썬 코드 작성
+    Raw Data -> Target Schema로 변환하는 파이썬 코드 작성.
+    반환: (code_str, raw_response_text, error_message)
     """
     client = genai.Client(api_key=api_key)
-    
+
     target_cols_str = ", ".join([f"'{c}'" for c in target_columns])
-    
+
     system_instruction = f"""
 당신은 Python Pandas 전문가입니다.
 Raw Excel Data를 정제하여, 반드시 **[Target Schema]**에 정의된 컬럼을 가진 DataFrame으로 변환하는 `transform(df)` 함수를 작성하세요.
@@ -173,6 +177,7 @@ Raw Excel Data를 정제하여, 반드시 **[Target Schema]**에 정의된 컬�
    - 헤더 탐색, 불필요한 상단 행 제거
    - '합계', '소계' 등 통계 행 제거
    - Wide to Long (Melt) 변환 적극 활용
+   - 헤더나 데이터 시작 행을 찾지 못해도 `ValueError`를 던지지 말고, 합리적인 기본 인덱스를 사용하거나 빈 DataFrame이라도 반환하세요.
 
 ### 출력 형식
 마크다운 코드 블럭(```python ... ```) 안에 파이썬 코드를 작성하세요.
@@ -214,12 +219,22 @@ def transform(df):
 위 데이터를 [{target_cols_str}] 컬럼을 가진 데이터프레임으로 변환하는 코드를 작성해주세요.
 """
 
-    resp = client.models.generate_content(
-        model="gemini-3-pro-preview",
-        contents=system_instruction + "\n" + prompt,
-    )
-    
-    return extract_python_code(resp.text)
+    raw_text = ""
+    try:
+        resp = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=system_instruction + "\n" + prompt,
+        )
+        raw_text = getattr(resp, "text", "") or ""
+        if not raw_text.strip():
+            raise ValueError("LLM 응답이 비어 있습니다. API 키/쿼터 또는 네트워크를 확인하세요.")
+
+        code = extract_python_code(raw_text)
+        if not code.strip():
+            raise ValueError("LLM이 코드를 반환하지 않았습니다. 프롬프트를 다시 시도하거나 프리뷰 행 수를 줄여보세요.")
+        return code, raw_text, None
+    except Exception as e:
+        return "", raw_text, str(e)
 
 
 # ==============================================================================
@@ -228,21 +243,22 @@ def transform(df):
 
 
 def execute_user_code(code_str: str, df_raw: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dict], str]:
-    local_scope = {"pd": pd, "df_raw": df_raw, "np": pd.np} 
-    
+    """사용자/LLM 코드 실행 래퍼. 에러를 문자열로 반환한다."""
+    local_scope = {"pd": pd, "df_raw": df_raw, "np": np, "re": re}
+
     try:
         exec(code_str, globals(), local_scope)
         if "transform" not in local_scope:
             return None, None, "Error: 'transform' 함수가 정의되지 않았습니다."
-            
+
         transform_func = local_scope["transform"]
         df_clean, metadata = transform_func(df_raw.copy())
-        
+
         if not isinstance(df_clean, pd.DataFrame):
             return None, None, "Error: 반환값은 DataFrame이어야 합니다."
-            
+
         return df_clean, metadata, ""
-        
+
     except Exception:
         return None, None, traceback.format_exc()
 
@@ -283,15 +299,18 @@ def main_app():
         st.session_state["generated_codes"] = {}
     if "results" not in st.session_state:
         st.session_state["results"] = {}
+    if "llm_logs" not in st.session_state:
+        st.session_state["llm_logs"] = []
 
     # 1. 파일 로딩
     all_data = {}
     if uploaded_files:
-        for uf in uploaded_files:
+        for file_idx, uf in enumerate(uploaded_files):
             try:
                 dfs = read_excel_sheets(uf)
                 for sname, df in dfs.items():
-                    all_data[(uf.name, sname)] = df
+                    # (업로드 순서 index, 파일명, 시트명)으로 키를 만들어 동일 파일명 충돌 방지
+                    all_data[(file_idx, uf.name, sname)] = df
             except Exception as e:
                 st.sidebar.error(f"{uf.name} 로드 실패: {e}")
                 with st.sidebar.expander("상세 에러"):
@@ -304,24 +323,39 @@ def main_app():
     # 2. 타겟 스키마 정의
     st.header("1️⃣ 공통 타겟 스키마 (Target Schema) 정의")
     
-    col1, col2 = st.columns([1, 3])
+    # --- 스키마 선택 영역 (전체 폭)
+    schema_keys = list(all_data.keys())
+    label_map = {k: f"{k[0]+1}) {k[1]}::{k[2]}" for k in schema_keys}
+    default_selection = schema_keys[: min(3, len(schema_keys))]
+    selected_for_schema = st.multiselect(
+        "스키마 제안에 사용할 시트 선택 (선택 없으면 전체 사용)",
+        options=schema_keys,
+        default=default_selection,
+        format_func=lambda k: label_map.get(k, str(k)),
+        help="긴 파일/시트 이름을 전부 표시하기 위해 영역을 넓혔습니다. 필요 시 원하는 시트만 선택하세요.",
+    )
+
+    col1, col2 = st.columns([1, 2.2])
     with col1:
-        if st.button("🤖 AI 스키마 자동 제안"):
+        if st.button("🤖 AI 스키마 자동 제안", use_container_width=True):
             with st.spinner("데이터 샘플 분석 중..."):
+                target_keys = selected_for_schema or schema_keys
                 samples = []
-                for k, df in list(all_data.items())[:3]:
+                for k in target_keys:
+                    df = all_data[k]
                     samples.append(get_dataframe_preview_markdown(df, rows=10))
                 
-                schema_def = generate_target_schema(api_key, samples)
-                
-                # 에러 체크
-                if "_error" in schema_def:
+                schema_def, raw_resp, err = generate_target_schema(api_key, samples)
+                st.session_state["llm_logs"].append({"type": "schema", "raw": raw_resp, "error": err})
+
+                if err:
                     st.error("스키마 생성 실패")
-                    st.error(schema_def["_error"])
+                    st.error(err)
                     with st.expander("AI 원본 응답"):
-                        st.text(schema_def.get("_raw_response", ""))
+                        st.text(raw_resp or "(빈 응답)")
                 else:
                     st.session_state["target_schema"] = schema_def
+                    st.success("스키마 제안 완료 (편집 가능)")
 
     with col2:
         current_schema = st.session_state.get("target_schema")
@@ -331,7 +365,7 @@ def main_app():
         schema_text = st.text_area(
             "스키마 정의 (JSON 편집 가능)", 
             value=json.dumps(current_schema, indent=2, ensure_ascii=False),
-            height=200
+            height=240,
         )
         try:
             parsed = json.loads(schema_text)
@@ -347,69 +381,163 @@ def main_app():
     target_columns = [c["name"] for c in schema.get("columns", []) if isinstance(c, dict) and "name" in c]
     
     if not target_columns:
-        st.warning("위에서 타겟 스키마를 정의하거나 AI 제안을 받아주세요.")
+        st.warning("타겟 스키마에 columns가 없습니다. JSON에 columns 리스트를 추가해주세요.")
         return
 
     st.success(f"목표 컬럼: {target_columns}")
 
     # 3. 개별 파일 변환 코드 생성 및 실행
     st.header("2️⃣ 파일별 변환 및 병합")
-    
-    tabs = st.tabs([f"{f}::{s}" for f, s in all_data.keys()])
-    
+
+    entries = list(all_data.items())
+    options = [key for key, _ in entries]
+
+    # 전체 자동 실행 (선택한 시트만)
+    st.markdown("#### ⚡ 선택 시트 일괄 변환")
+    auto_run_targets = st.multiselect(
+        "일괄 실행 대상 시트 선택",
+        options=options,
+        default=options,
+        format_func=lambda k: f"{k[0]+1}) {k[1]}::{k[2]}",
+        help="여기서 선택한 시트만 코드 생성+실행을 순차 처리합니다."
+    )
+    auto_run = st.button("선택 시트 코드 생성 + 실행", help="선택한 시트를 현재 스키마로 순차 실행합니다.")
+
     valid_dfs = []
 
-    for i, (key, df_raw) in enumerate(all_data.items()):
-        fname, sname = key
-        unique_id = f"{fname}::{sname}"
-        
-        with tabs[i]:
-            c1, c2 = st.columns([1, 1])
-            
-            # 코드 생성
-            with c1:
-                st.markdown("#### Raw Data Preview")
-                # 안전한 렌더링 사용 (Raw 데이터는 보통 타입이 섞여 있으므로 주의 필요)
-                safe_dataframe_display(df_raw.head(15))
-                
-                if st.button(f"코드 생성 ({sname})", key=f"gen_{unique_id}"):
-                    with st.spinner("변환 코드 작성 중..."):
-                        preview = get_dataframe_preview_markdown(df_raw)
-                        code = generate_transform_code(api_key, fname, sname, preview, target_columns)
-                        st.session_state["generated_codes"][unique_id] = code
-                        st.rerun()
-            
-            # 코드 실행
-            with c2:
-                st.markdown("#### Transformation Code")
-                code_val = st.session_state["generated_codes"].get(unique_id, "")
-                edited_code = st.text_area("Python Code", code_val, height=300, key=f"edit_{unique_id}")
-                st.session_state["generated_codes"][unique_id] = edited_code
-                
-                if st.button(f"실행 ({sname})", key=f"exec_{unique_id}"):
-                    df_res, meta, err = execute_user_code(edited_code, df_raw)
+    if auto_run:
+        run_list = [item for item in entries if item[0] in auto_run_targets]
+        if not run_list:
+            st.warning("일괄 실행할 시트를 선택해주세요.")
+        else:
+            success, fail = [], []
+            progress = st.progress(0)
+            total = len(run_list)
+            for idx, (key, df_raw) in enumerate(run_list, start=1):
+                file_idx, fname, sname = key
+                unique_id = f"{file_idx}:{fname}::{sname}"
+                try:
+                    preview = get_dataframe_preview_markdown(df_raw)
+                    code, raw_resp, err = generate_transform_code(api_key, fname, sname, preview, target_columns)
+                    st.session_state["llm_logs"].append({"type": "code", "file": fname, "sheet": sname, "raw": raw_resp, "error": err})
                     if err:
-                        st.error("코드 실행 오류")
-                        st.code(err, language="text")
+                        fail.append((fname, sname, f"생성 실패: {err}"))
+                        continue
+
+                    st.session_state["generated_codes"][unique_id] = code
+                    st.session_state[f"edit_{unique_id}"] = code
+
+                    df_res, meta, exec_err = execute_user_code(code, df_raw)
+                    if exec_err:
+                        fail.append((fname, sname, f"실행 오류: {exec_err.splitlines()[-1] if exec_err else exec_err}"))
+                        continue
+
+                    missing = [c for c in target_columns if c not in df_res.columns]
+                    if missing:
+                        fail.append((fname, sname, f"목표 컬럼 누락: {missing}"))
+                        st.session_state["results"].pop(unique_id, None)
+                        continue
+
+                    df_res = df_res[target_columns]
+                    df_res["_source_file"] = fname
+                    df_res["_source_sheet"] = sname
+                    st.session_state["results"][unique_id] = df_res
+                    success.append((fname, sname, len(df_res)))
+                finally:
+                    progress.progress(idx / total)
+
+            if success:
+                st.success(f"자동 변환 성공 {len(success)}건")
+                for f, s, rows in success:
+                    st.write(f"✅ {f} / {s} ({rows}행)")
+            if fail:
+                st.error(f"실패 {len(fail)}건")
+                for f, s, msg in fail:
+                    st.write(f"❌ {f} / {s}: {msg}")
+
+    # 수동 선택 영역
+    selected_key = st.selectbox(
+        "수동으로 변환할 파일/시트 선택",
+        options=options,
+        format_func=lambda k: f"{k[0]+1}) {k[1]}::{k[2]}"
+    )
+
+    for key, df_raw in entries:
+        file_idx, fname, sname = key
+        unique_id = f"{file_idx}:{fname}::{sname}"
+
+        if key != selected_key:
+            if unique_id in st.session_state["results"]:
+                valid_dfs.append(st.session_state["results"][unique_id])
+            continue
+
+        st.subheader(f"선택된 시트: {fname} / {sname}")
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            st.markdown("#### Raw Data Preview")
+            safe_dataframe_display(df_raw.head(15))
+
+            if st.button(f"코드 생성 ({sname})", key=f"gen_{unique_id}"):
+                with st.spinner("변환 코드 작성 중..."):
+                    preview = get_dataframe_preview_markdown(df_raw)
+                    code, raw_resp, err = generate_transform_code(api_key, fname, sname, preview, target_columns)
+                    st.session_state["llm_logs"].append({"type": "code", "file": fname, "sheet": sname, "raw": raw_resp, "error": err})
+                    if err:
+                        st.error(f"코드 생성 실패: {err}")
+                        with st.expander("AI 원본 응답"):
+                            st.text(raw_resp or "(빈 응답)")
                     else:
-                        # 스키마 검증
-                        missing = [c for c in target_columns if c not in df_res.columns]
-                        if missing:
-                            st.warning(f"⚠️ 주의: 목표 컬럼 누락 -> {missing}")
-                        else:
-                            # 컬럼 순서 정렬
-                            df_res = df_res[target_columns] 
-                            
-                            df_res["_source_file"] = fname
-                            df_res["_source_sheet"] = sname
-                            
-                            st.session_state["results"][unique_id] = df_res
-                            st.success("변환 성공!")
-                            safe_dataframe_display(df_res.head(5))
-                            st.rerun()
+                        st.session_state["generated_codes"][unique_id] = code
+                        st.session_state[f"edit_{unique_id}"] = code
+                        st.success("코드 생성 완료. 필요하면 수정 후 실행하세요.")
+
+        with c2:
+            st.markdown("#### Transformation Code")
+            code_key = f"edit_{unique_id}"
+            generated_code = st.session_state["generated_codes"].get(unique_id, "")
+            if code_key not in st.session_state and generated_code:
+                st.session_state[code_key] = generated_code
+            edited_code = st.text_area("Python Code", st.session_state.get(code_key, generated_code), height=300, key=code_key)
+            if not edited_code.strip():
+                st.info("코드가 비어 있습니다. 좌측에서 '코드 생성'을 다시 눌러주세요. 에러가 있다면 아래 LLM 응답 로그를 확인하세요.")
+            st.session_state["generated_codes"][unique_id] = edited_code
+
+            if st.button(f"실행 ({sname})", key=f"exec_{unique_id}"):
+                df_res, meta, err = execute_user_code(edited_code, df_raw)
+                if err:
+                    st.error("코드 실행 오류")
+                    st.code(err, language="text")
+                else:
+                    missing = [c for c in target_columns if c not in df_res.columns]
+                    if missing:
+                        st.warning(f"⚠️ 목표 컬럼 누락 -> {missing}")
+                        st.session_state["results"].pop(unique_id, None)
+                    else:
+                        df_res = df_res[target_columns]
+                        df_res["_source_file"] = fname
+                        df_res["_source_sheet"] = sname
+                        st.session_state["results"][unique_id] = df_res
+                        st.success("변환 성공! 아래에서 병합 가능")
+                        safe_dataframe_display(df_res.head(5))
 
         if unique_id in st.session_state["results"]:
             valid_dfs.append(st.session_state["results"][unique_id])
+
+    # 진행 현황 요약
+    st.divider()
+    st.markdown("### 진행 현황")
+    status_rows = []
+    for (idx, fname, sname) in all_data.keys():
+        uid = f"{idx}:{fname}::{sname}"
+        status_rows.append({
+            "#": idx + 1,
+            "파일": fname,
+            "시트": sname,
+            "코드 생성": "✅" if uid in st.session_state["generated_codes"] and st.session_state["generated_codes"][uid].strip() else "⬜",
+            "실행 완료": "✅" if uid in st.session_state["results"] else "⬜",
+        })
+    st.dataframe(pd.DataFrame(status_rows))
 
     # 4. 최종 병합 및 다운로드
     st.divider()
@@ -433,6 +561,18 @@ def main_app():
             st.code(traceback.format_exc())
     else:
         st.info("아직 변환된 데이터가 없습니다. 각 탭에서 코드를 생성하고 실행해주세요.")
+
+    # 디버그: LLM 원본 응답 모아보기
+    with st.expander("LLM 응답 로그"):
+        if not st.session_state["llm_logs"]:
+            st.write("로그 없음")
+        else:
+            for i, log in enumerate(reversed(st.session_state["llm_logs"])):
+                label = f"{i+1}. {log.get('type', '')} | {log.get('file', '')} {log.get('sheet', '')}"
+                st.markdown(f"**{label}**")
+                if log.get("error"):
+                    st.error(log["error"])
+                st.code(log.get("raw", "(raw 없음)"))
 
 
 def main():
