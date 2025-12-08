@@ -280,6 +280,10 @@ def main_app():
 
     # --- 설정 ---
     st.sidebar.header("설정")
+    
+    # API 키 안내 메시지
+    st.sidebar.info("💡 Key 입력하지 않아도 사용 가능합니다.")
+    
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
     if not api_key:
         api_key = os.environ.get("GEMINI_API_KEY")
