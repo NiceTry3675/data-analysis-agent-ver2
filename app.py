@@ -291,6 +291,7 @@ def main_app():
     uploaded_files = st.sidebar.file_uploader(
         "엑셀 파일 업로드 (여러 개)", type=["xls", "xlsx"], accept_multiple_files=True
     )
+    st.sidebar.caption("⚠️ **주의**: '같은 종류의 데이터지만 양식이 다른 파일'만 업로드해주세요. 성격이 아예 다른 데이터(예: 인구수 vs 매출)는 제외해야 정확도가 높습니다. 여러 시트가 있는 파일인 경우, 통일하고 싶지 않은 시트가 포함된 파일은 제안/변환 단계에서 제외 할 수 있습니다.")
 
     if not api_key:
         st.warning("Gemini API Key가 필요합니다.")
